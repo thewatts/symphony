@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Shortcut.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Shortcut.Issue}
+  alias SymphonyElixir.{Config, Issue}
 
   @base_url "https://api.app.shortcut.com/api/v3"
   @page_size 25
