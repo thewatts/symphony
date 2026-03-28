@@ -98,7 +98,7 @@ defmodule SymphonyElixir.CoreTest do
 
     tracker = Map.get(config, "tracker", %{})
     assert is_map(tracker)
-    assert Map.get(tracker, "kind") == "linear"
+    assert Map.get(tracker, "kind") in ["linear", "shortcut"]
     assert is_binary(Map.get(tracker, "project_slug"))
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
@@ -883,7 +883,7 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue)
 
-    assert prompt =~ "You are working on a Linear issue."
+    assert prompt =~ "You are working on an issue."
     assert prompt =~ "Identifier: MT-777"
     assert prompt =~ "Title: Make fallback prompt useful"
     assert prompt =~ "Body:"
@@ -959,7 +959,7 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
+    assert prompt =~ "You are working on issue `MT-616`"
     assert prompt =~ "Issue context:"
     assert prompt =~ "Identifier: MT-616"
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
@@ -968,7 +968,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is an unattended orchestration session."
     assert prompt =~ "Only stop early for a true blocker"
     assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
+    assert prompt =~ "open and follow `.claude/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
@@ -992,7 +992,74 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt == "Retry #2"
   end
 
-  test "agent runner keeps workspace after successful codex run" do
+  # ---------------------------------------------------------------------------
+  # Helpers shared by agent runner / app server tests
+  # ---------------------------------------------------------------------------
+
+  # Returns a Req plug that responds to Anthropic Messages API calls with a
+  # simple end_turn response. Captures each request body into `agent` process.
+  defp end_turn_api_plug(test_pid) do
+    fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:api_request, Jason.decode!(body)})
+
+      Req.Test.json(conn, %{
+        "id" => "msg_test",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "claude-opus-4-6",
+        "stop_reason" => "end_turn",
+        "content" => [%{"type" => "text", "text" => "Done."}],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+      })
+    end
+  end
+
+  # Returns a Req plug that first responds with tool_use, then end_turn.
+  defp tool_then_end_turn_plug(test_pid, tool_name, tool_input) do
+    counter = :counters.new(1, [])
+
+    fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:api_request, Jason.decode!(body)})
+      n = :counters.get(counter, 1) + 1
+      :counters.put(counter, 1, n)
+
+      response =
+        if n == 1 do
+          %{
+            "id" => "msg_tool",
+            "type" => "message",
+            "role" => "assistant",
+            "model" => "claude-opus-4-6",
+            "stop_reason" => "tool_use",
+            "content" => [
+              %{"type" => "text", "text" => "Calling tool."},
+              %{"type" => "tool_use", "id" => "tool_call_1", "name" => tool_name, "input" => tool_input}
+            ],
+            "usage" => %{"input_tokens" => 20, "output_tokens" => 10}
+          }
+        else
+          %{
+            "id" => "msg_end",
+            "type" => "message",
+            "role" => "assistant",
+            "model" => "claude-opus-4-6",
+            "stop_reason" => "end_turn",
+            "content" => [%{"type" => "text", "text" => "Done after tool."}],
+            "usage" => %{"input_tokens" => 30, "output_tokens" => 5}
+          }
+        end
+
+      Req.Test.json(conn, response)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Agent runner tests
+  # ---------------------------------------------------------------------------
+
+  test "agent runner keeps workspace after successful run" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1002,7 +1069,6 @@ defmodule SymphonyElixir.CoreTest do
     try do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
-      codex_binary = Path.join(test_root, "fake-codex")
 
       File.mkdir_p!(template_repo)
       File.mkdir_p!(workspace_root)
@@ -1013,37 +1079,9 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "add", "README.md"])
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      count=0
-      while IFS= read -r line; do
-        count=$((count + 1))
-        case "$count" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server"
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md"
       )
 
       issue = %Issue{
@@ -1056,19 +1094,18 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       before = MapSet.new(File.ls!(workspace_root))
-      assert :ok = AgentRunner.run(issue)
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 app_server: SymphonyElixir.Test.StubAppServer,
+                 issue_state_fetcher: fn [_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
       entries_after = MapSet.new(File.ls!(workspace_root))
+      created = MapSet.difference(entries_after, before) |> Enum.filter(&(&1 == "S-99"))
+      assert length(created) == 1
 
-      created =
-        MapSet.difference(entries_after, before) |> Enum.filter(&(&1 == "S-99"))
-
-      created = MapSet.new(created)
-
-      assert MapSet.size(created) == 1
-      workspace_name = created |> Enum.to_list() |> List.first()
-      assert workspace_name == "S-99"
-
-      workspace = Path.join(workspace_root, workspace_name)
+      workspace = Path.join(workspace_root, "S-99")
       assert File.exists?(workspace)
       assert File.exists?(Path.join(workspace, "README.md"))
     after
@@ -1076,7 +1113,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner forwards timestamped codex updates to recipient" do
+  test "agent runner forwards timestamped updates to recipient" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1086,7 +1123,6 @@ defmodule SymphonyElixir.CoreTest do
     try do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
-      codex_binary = Path.join(test_root, "fake-codex")
 
       File.mkdir_p!(template_repo)
       File.write!(Path.join(template_repo, "README.md"), "# test")
@@ -1096,46 +1132,16 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "add", "README.md"])
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
-      File.write!(
-        codex_binary,
-        """
-        #!/bin/sh
-        count=0
-        while IFS= read -r line; do
-          count=$((count + 1))
-          case "$count" in
-            1)
-              printf '%s\\n' '{\"id\":1,\"result\":{}}'
-              ;;
-            2)
-              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-live\"}}}'
-              ;;
-            3)
-              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
-              ;;
-            4)
-              printf '%s\\n' '{\"method\":\"turn/completed\"}'
-              ;;
-            *)
-              ;;
-          esac
-        done
-        """
-      )
-
-      File.chmod!(codex_binary, 0o755)
-
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server"
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md"
       )
 
       issue = %Issue{
         id: "issue-live-updates",
         identifier: "MT-99",
         title: "Smoke test",
-        description: "Capture codex updates",
+        description: "Capture agent updates",
         state: "In Progress",
         url: "https://example.org/issues/MT-99",
         labels: ["backend"]
@@ -1147,18 +1153,15 @@ defmodule SymphonyElixir.CoreTest do
                AgentRunner.run(
                  issue,
                  test_pid,
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                 app_server: SymphonyElixir.Test.StubAppServer,
+                 issue_state_fetcher: fn [_id] -> {:ok, [%{issue | state: "Done"}]} end
                )
 
       assert_receive {:codex_worker_update, "issue-live-updates",
-                      %{
-                        event: :session_started,
-                        timestamp: %DateTime{},
-                        session_id: session_id
-                      }},
+                      %{event: :session_started, timestamp: %DateTime{}, session_id: session_id}},
                      500
 
-      assert session_id == "thread-live-turn-live"
+      assert is_binary(session_id) and byte_size(session_id) > 0
     after
       File.rm_rf(test_root)
     end
@@ -1244,8 +1247,6 @@ defmodule SymphonyElixir.CoreTest do
     try do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
-      codex_binary = Path.join(test_root, "fake-codex")
-      trace_file = Path.join(test_root, "codex.trace")
 
       File.mkdir_p!(template_repo)
       File.write!(Path.join(template_repo, "README.md"), "# test")
@@ -1255,62 +1256,20 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "add", "README.md"])
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      run_id="$(date +%s%N)-$$"
-      printf 'RUN:%s\\n' "$run_id" >> "$trace_file"
-      count=0
-
-      while IFS= read -r line; do
-        count=$((count + 1))
-        printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-
-      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
-
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server",
         max_turns: 3
       )
 
       parent = self()
+      call_count = :counters.new(1, [])
 
       state_fetcher = fn [_issue_id] ->
-        attempt = Process.get(:agent_turn_fetch_count, 0) + 1
-        Process.put(:agent_turn_fetch_count, attempt)
-        send(parent, {:issue_state_fetch, attempt})
-
-        state =
-          if attempt == 1 do
-            "In Progress"
-          else
-            "Done"
-          end
+        n = :counters.get(call_count, 1) + 1
+        :counters.put(call_count, 1, n)
+        send(parent, {:issue_state_fetch, n})
+        state = if n == 1, do: "In Progress", else: "Done"
 
         {:ok,
          [
@@ -1334,33 +1293,15 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok = AgentRunner.run(issue, nil,
+               app_server: SymphonyElixir.Test.StubAppServer,
+               issue_state_fetcher: state_fetcher
+             )
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
-
-      lines = File.read!(trace_file) |> String.split("\n", trim: true)
-
-      assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
-      assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
-
-      turn_texts =
-        lines
-        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
-        |> Enum.map(&String.trim_leading(&1, "JSON:"))
-        |> Enum.map(&Jason.decode!/1)
-        |> Enum.filter(&(&1["method"] == "turn/start"))
-        |> Enum.map(fn payload ->
-          get_in(payload, ["params", "input"])
-          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
-        end)
-
-      assert length(turn_texts) == 2
-      assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
-      refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
-      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
-      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      # Only 2 turns ran (first returned active, second returned done)
+      assert :counters.get(call_count, 1) == 2
     after
-      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end
@@ -1375,8 +1316,6 @@ defmodule SymphonyElixir.CoreTest do
     try do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
-      codex_binary = Path.join(test_root, "fake-codex")
-      trace_file = Path.join(test_root, "codex.trace")
 
       File.mkdir_p!(template_repo)
       File.write!(Path.join(template_repo, "README.md"), "# test")
@@ -1386,45 +1325,9 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "add", "README.md"])
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      printf 'RUN\\n' >> "$trace_file"
-      count=0
-
-      while IFS= read -r line; do
-        count=$((count + 1))
-        printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-
-      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
-
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server",
         max_turns: 2
       )
 
@@ -1451,367 +1354,182 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, self(),
+                 app_server: SymphonyElixir.Test.StubAppServer,
+                 issue_state_fetcher: state_fetcher
+               )
 
-      trace = File.read!(trace_file)
-      assert length(String.split(trace, "RUN", trim: true)) == 1
-      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+      # Count :session_started messages received — each corresponds to one turn
+      turns_started =
+        Enum.reduce_while(Stream.repeatedly(fn -> :ok end), 0, fn _, acc ->
+          receive do
+            {:codex_worker_update, _, %{event: :session_started}} -> {:cont, acc + 1}
+          after
+            100 -> {:halt, acc}
+          end
+        end)
+
+      # max_turns is 2
+      assert turns_started == 2
     after
-      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end
 
-  test "app server starts with workspace cwd and expected startup command" do
+  # ---------------------------------------------------------------------------
+  # App server (Claude.AppServer) tests
+  # ---------------------------------------------------------------------------
+
+  test "app server calls Anthropic API with correct model and tool specs" do
     test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-app-server-args-#{System.unique_integer([:positive])}"
-      )
+      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-api-#{System.unique_integer([:positive])}")
 
     try do
-      workspace_root = Path.join(test_root, "workspaces")
-      workspace = Path.join(workspace_root, "MT-77")
-      codex_binary = Path.join(test_root, "fake-codex")
-      trace_file = Path.join(test_root, "codex-args.trace")
-      previous_trace = System.get_env("SYMP_TEST_CODex_TRACE")
-
-      on_exit(fn ->
-        if is_binary(previous_trace) do
-          System.put_env("SYMP_TEST_CODex_TRACE", previous_trace)
-        else
-          System.delete_env("SYMP_TEST_CODex_TRACE")
-        end
-      end)
-
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      workspace = Path.join(test_root, "workspace")
       File.mkdir_p!(workspace)
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-args.trace}"
-      count=0
-      printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
-      printf 'CWD:%s\\n' \"$PWD\" >> \"$trace_file\"
-
-      while IFS= read -r line; do
-        count=$((count + 1))
-        printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-77\"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server"
+        workspace_root: test_root,
+        claude_model: "claude-opus-4-6"
       )
 
+      test_pid = self()
+
       issue = %Issue{
-        id: "issue-args",
+        id: "issue-api-shape",
         identifier: "MT-77",
-        title: "Validate codex args",
-        description: "Check startup args and cwd",
+        title: "Check API shape",
+        description: "Verify model and tools are sent",
         state: "In Progress",
         url: "https://example.org/issues/MT-77",
-        labels: ["backend"]
+        labels: []
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
-      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+      Req.Test.stub(SymphonyElixir.Claude.AppServer, end_turn_api_plug(test_pid))
 
-      trace = File.read!(trace_file)
-      lines = String.split(trace, "\n", trim: true)
+      {:ok, session} = AppServer.start_session(workspace)
 
-      assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "app-server")
-      refute Enum.any?(lines, &String.contains?(&1, "--yolo"))
-      assert cwd_line = Enum.find(lines, fn line -> String.starts_with?(line, "CWD:") end)
-      assert String.ends_with?(cwd_line, Path.basename(workspace))
+      session_with_plug = Map.put(session, :plug, {Req.Test, SymphonyElixir.Claude.AppServer})
 
-      assert Enum.any?(lines, fn line ->
-               if String.starts_with?(line, "JSON:") do
-                 line
-                 |> String.trim_leading("JSON:")
-                 |> Jason.decode!()
-                 |> then(fn payload ->
-                   expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
-                     }
-                   }
+      assert {:ok, _result} = AppServer.run_turn(session_with_plug, "Fix it", issue)
 
-                   payload["method"] == "thread/start" &&
-                     get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
-                     get_in(payload, ["params", "sandbox"]) == "workspace-write" &&
-                     get_in(payload, ["params", "cwd"]) == canonical_workspace
-                 end)
-               else
-                 false
-               end
-             end)
-
-      expected_turn_sandbox_policy = %{
-        "type" => "workspaceWrite",
-        "writableRoots" => [canonical_workspace],
-        "readOnlyAccess" => %{"type" => "fullAccess"},
-        "networkAccess" => false,
-        "excludeTmpdirEnvVar" => false,
-        "excludeSlashTmp" => false
-      }
-
-      assert Enum.any?(lines, fn line ->
-               if String.starts_with?(line, "JSON:") do
-                 line
-                 |> String.trim_leading("JSON:")
-                 |> Jason.decode!()
-                 |> then(fn payload ->
-                   expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
-                     }
-                   }
-
-                   payload["method"] == "turn/start" &&
-                     get_in(payload, ["params", "cwd"]) == canonical_workspace &&
-                     get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
-                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_sandbox_policy
-                 end)
-               else
-                 false
-               end
-             end)
+      assert_receive {:api_request, body}
+      assert body["model"] == "claude-opus-4-6"
+      assert is_list(body["tools"])
+      tool_names = Enum.map(body["tools"], & &1["name"])
+      assert "shortcut_api" in tool_names
+      assert is_list(body["messages"])
+      assert List.first(body["messages"])["role"] == "user"
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "app server startup command supports codex args override from workflow config" do
+  test "app server handles tool_use response and sends tool results back" do
     test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-app-server-custom-args-#{System.unique_integer([:positive])}"
-      )
+      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-tool-use-#{System.unique_integer([:positive])}")
 
     try do
-      workspace_root = Path.join(test_root, "workspaces")
-      workspace = Path.join(workspace_root, "MT-88")
-      codex_binary = Path.join(test_root, "fake-codex")
-      trace_file = Path.join(test_root, "codex-custom-args.trace")
-      previous_trace = System.get_env("SYMP_TEST_CODex_TRACE")
-
-      on_exit(fn ->
-        if is_binary(previous_trace) do
-          System.put_env("SYMP_TEST_CODex_TRACE", previous_trace)
-        else
-          System.delete_env("SYMP_TEST_CODex_TRACE")
-        end
-      end)
-
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      workspace = Path.join(test_root, "workspace")
       File.mkdir_p!(workspace)
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
-      count=0
-      printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
 
-      while IFS= read -r line; do
-        count=$((count + 1))
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        codex_command: "#{codex_binary} --model gpt-5.3-codex app-server"
-      )
+      test_pid = self()
 
       issue = %Issue{
-        id: "issue-custom-args",
+        id: "issue-tool-use",
         identifier: "MT-88",
-        title: "Validate custom codex args",
-        description: "Check startup args override",
+        title: "Check tool use",
+        description: "Verify tool call round-trip",
         state: "In Progress",
         url: "https://example.org/issues/MT-88",
-        labels: ["backend"]
+        labels: []
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
+      Req.Test.stub(
+        SymphonyElixir.Claude.AppServer,
+        tool_then_end_turn_plug(test_pid, "linear_graphql", %{"query" => "{ viewer { id } }"})
+      )
 
-      trace = File.read!(trace_file)
-      lines = String.split(trace, "\n", trim: true)
+      {:ok, session} = AppServer.start_session(workspace)
+      session_with_plug = Map.put(session, :plug, {Req.Test, SymphonyElixir.Claude.AppServer})
 
-      assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "--model gpt-5.3-codex app-server")
-      refute String.contains?(argv_line, "--ask-for-approval never")
-      refute String.contains?(argv_line, "--sandbox danger-full-access")
+      event_collector = fn msg -> send(test_pid, {:event, msg.event}) end
+
+      stub_tool_executor = fn _tool, _args ->
+        %{"success" => true, "output" => ~s({"data":{"viewer":{"id":"u1"}}})}
+      end
+
+      assert {:ok, _result} =
+               AppServer.run_turn(session_with_plug, "Query Linear", issue,
+                 on_message: event_collector,
+                 tool_executor: stub_tool_executor
+               )
+
+      # Should have received 2 API calls: one tool_use, one end_turn
+      assert_receive {:api_request, _first_body}
+      assert_receive {:api_request, second_body}
+
+      # Second request should include the tool_result message
+      messages = second_body["messages"]
+      assert Enum.any?(messages, fn m -> m["role"] == "assistant" end)
+
+      tool_result_msg = Enum.find(messages, fn m ->
+        m["role"] == "user" and is_list(m["content"]) and
+          Enum.any?(m["content"], &(&1["type"] == "tool_result"))
+      end)
+
+      assert tool_result_msg != nil
+
+      assert_receive {:event, :tool_call_completed}
+      assert_receive {:event, :turn_completed}
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "app server startup payload uses configurable approval and sandbox settings from workflow config" do
+  test "app server emits session_started and turn_completed events" do
     test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-app-server-policy-overrides-#{System.unique_integer([:positive])}"
-      )
+      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-events-#{System.unique_integer([:positive])}")
 
     try do
-      workspace_root = Path.join(test_root, "workspaces")
-      workspace = Path.join(workspace_root, "MT-99")
-      codex_binary = Path.join(test_root, "fake-codex")
-      trace_file = Path.join(test_root, "codex-policy-overrides.trace")
-      previous_trace = System.get_env("SYMP_TEST_CODex_TRACE")
-
-      on_exit(fn ->
-        if is_binary(previous_trace) do
-          System.put_env("SYMP_TEST_CODex_TRACE", previous_trace)
-        else
-          System.delete_env("SYMP_TEST_CODex_TRACE")
-        end
-      end)
-
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      workspace = Path.join(test_root, "workspace")
       File.mkdir_p!(workspace)
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-policy-overrides.trace}"
-      count=0
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
 
-      while IFS= read -r line; do
-        count=$((count + 1))
-        printf 'JSON:%s\\n' "$line" >> "$trace_file"
-
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-99"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"method":"turn/completed"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-
-      workspace_cache = Path.join(Path.expand(workspace), ".cache")
-      File.mkdir_p!(workspace_cache)
-
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server",
-        codex_approval_policy: "on-request",
-        codex_thread_sandbox: "workspace-write",
-        codex_turn_sandbox_policy: %{
-          type: "workspaceWrite",
-          writableRoots: [Path.expand(workspace), workspace_cache]
-        }
-      )
+      test_pid = self()
 
       issue = %Issue{
-        id: "issue-policy-overrides",
+        id: "issue-events",
         identifier: "MT-99",
-        title: "Validate codex policy overrides",
-        description: "Check startup policy payload overrides",
+        title: "Check events",
+        description: "Verify event emission",
         state: "In Progress",
         url: "https://example.org/issues/MT-99",
-        labels: ["backend"]
+        labels: []
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
+      Req.Test.stub(SymphonyElixir.Claude.AppServer, end_turn_api_plug(test_pid))
 
-      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+      {:ok, session} = AppServer.start_session(workspace)
+      session_with_plug = Map.put(session, :plug, {Req.Test, SymphonyElixir.Claude.AppServer})
 
-      assert Enum.any?(lines, fn line ->
-               if String.starts_with?(line, "JSON:") do
-                 line
-                 |> String.trim_leading("JSON:")
-                 |> Jason.decode!()
-                 |> then(fn payload ->
-                   payload["method"] == "thread/start" &&
-                     get_in(payload, ["params", "approvalPolicy"]) == "on-request" &&
-                     get_in(payload, ["params", "sandbox"]) == "workspace-write"
-                 end)
-               else
-                 false
-               end
-             end)
+      collected_events = :ets.new(:events, [:bag, :public])
 
-      expected_turn_policy = %{
-        "type" => "workspaceWrite",
-        "writableRoots" => [Path.expand(workspace), workspace_cache]
-      }
+      on_message = fn msg ->
+        :ets.insert(collected_events, {msg.event})
+      end
 
-      assert Enum.any?(lines, fn line ->
-               if String.starts_with?(line, "JSON:") do
-                 line
-                 |> String.trim_leading("JSON:")
-                 |> Jason.decode!()
-                 |> then(fn payload ->
-                   payload["method"] == "turn/start" &&
-                     get_in(payload, ["params", "approvalPolicy"]) == "on-request" &&
-                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
-                 end)
-               else
-                 false
-               end
-             end)
+      assert {:ok, result} = AppServer.run_turn(session_with_plug, "Do it", issue, on_message: on_message)
+      assert result.result == :turn_completed
+      assert is_binary(result.session_id)
+
+      events = :ets.tab2list(collected_events) |> Enum.map(&elem(&1, 0))
+      assert :session_started in events
+      assert :turn_completed in events
     after
       File.rm_rf(test_root)
     end

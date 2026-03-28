@@ -199,6 +199,30 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Claude do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:api_key, :string)
+      field(:model, :string, default: "claude-opus-4-6")
+      field(:max_tokens, :integer, default: 16_384)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:api_key, :model, :max_tokens, :turn_timeout_ms, :stall_timeout_ms], empty_values: [])
+      |> validate_number(:max_tokens, greater_than: 0)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -268,6 +292,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude, Claude, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -360,16 +385,35 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:claude, with: &Claude.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
   defp finalize_settings(settings) do
+    tracker_api_key =
+      case settings.tracker.kind do
+        "shortcut" ->
+          resolve_secret_setting(settings.tracker.api_key, System.get_env("SHORTCUT_API_TOKEN"))
+
+        _ ->
+          resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY"))
+      end
+
+    tracker_assignee =
+      case settings.tracker.kind do
+        "shortcut" ->
+          resolve_secret_setting(settings.tracker.assignee, System.get_env("SHORTCUT_ASSIGNEE"))
+
+        _ ->
+          resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+      end
+
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+      | api_key: tracker_api_key,
+        assignee: tracker_assignee
     }
 
     workspace = %{
@@ -383,7 +427,12 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    claude = %{
+      settings.claude
+      | api_key: resolve_secret_setting(settings.claude.api_key, System.get_env("ANTHROPIC_API_KEY"))
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, claude: claude}
   end
 
   defp normalize_keys(value) when is_map(value) do

@@ -8,7 +8,7 @@ defmodule SymphonyElixir.TestSupport do
 
       alias SymphonyElixir.AgentRunner
       alias SymphonyElixir.CLI
-      alias SymphonyElixir.Codex.AppServer
+      alias SymphonyElixir.Claude.AppServer
       alias SymphonyElixir.Config
       alias SymphonyElixir.HttpServer
       alias SymphonyElixir.Linear.Client
@@ -114,6 +114,11 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          claude_api_key: "test-anthropic-api-key",
+          claude_model: "claude-opus-4-6",
+          claude_max_tokens: 16_384,
+          claude_turn_timeout_ms: 3_600_000,
+          claude_stall_timeout_ms: 300_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -151,6 +156,11 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    claude_api_key = Keyword.get(config, :claude_api_key)
+    claude_model = Keyword.get(config, :claude_model)
+    claude_max_tokens = Keyword.get(config, :claude_max_tokens)
+    claude_turn_timeout_ms = Keyword.get(config, :claude_turn_timeout_ms)
+    claude_stall_timeout_ms = Keyword.get(config, :claude_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -192,6 +202,12 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "claude:",
+        "  api_key: #{yaml_value(claude_api_key)}",
+        "  model: #{yaml_value(claude_model)}",
+        "  max_tokens: #{yaml_value(claude_max_tokens)}",
+        "  turn_timeout_ms: #{yaml_value(claude_turn_timeout_ms)}",
+        "  stall_timeout_ms: #{yaml_value(claude_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

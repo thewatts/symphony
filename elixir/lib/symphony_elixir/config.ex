@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
-  You are working on a Linear issue.
+  You are working on an issue.
 
   Identifier: {{ issue.identifier }}
   Title: {{ issue.title }}
@@ -24,6 +24,14 @@ defmodule SymphonyElixir.Config do
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
+        }
+
+  @type claude_runtime_settings :: %{
+          api_key: String.t(),
+          model: String.t(),
+          max_tokens: pos_integer(),
+          turn_timeout_ms: pos_integer(),
+          stall_timeout_ms: pos_integer()
         }
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
@@ -114,12 +122,34 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec claude_runtime_settings() :: {:ok, claude_runtime_settings()} | {:error, term()}
+  def claude_runtime_settings do
+    with {:ok, settings} <- settings() do
+      claude = settings.claude
+
+      case claude.api_key do
+        key when is_binary(key) and key != "" ->
+          {:ok,
+           %{
+             api_key: key,
+             model: claude.model,
+             max_tokens: claude.max_tokens,
+             turn_timeout_ms: claude.turn_timeout_ms,
+             stall_timeout_ms: claude.stall_timeout_ms
+           }}
+
+        _ ->
+          {:error, :missing_anthropic_api_key}
+      end
+    end
+  end
+
   defp validate_semantics(settings) do
     cond do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
 
-      settings.tracker.kind not in ["linear", "memory"] ->
+      settings.tracker.kind not in ["linear", "shortcut", "memory"] ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
@@ -127,6 +157,15 @@ defmodule SymphonyElixir.Config do
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
+
+      settings.tracker.kind == "shortcut" and not is_binary(settings.tracker.api_key) ->
+        {:error, :missing_shortcut_api_token}
+
+      settings.tracker.kind == "shortcut" and not is_binary(settings.tracker.project_slug) ->
+        {:error, :missing_shortcut_workflow_id}
+
+      not is_binary(settings.claude.api_key) ->
+        {:error, :missing_anthropic_api_key}
 
       true ->
         :ok
@@ -146,6 +185,15 @@ defmodule SymphonyElixir.Config do
 
       :workflow_front_matter_not_a_map ->
         "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"
+
+      :missing_anthropic_api_key ->
+        "Missing Anthropic API key. Set `claude.api_key` in `WORKFLOW.md` or export `ANTHROPIC_API_KEY`."
+
+      :missing_shortcut_api_token ->
+        "Missing Shortcut API token. Set `tracker.api_key` in `WORKFLOW.md` or export `SHORTCUT_API_TOKEN`."
+
+      :missing_shortcut_workflow_id ->
+        "Missing Shortcut workflow ID. Set `tracker.project_slug` in `WORKFLOW.md`."
 
       other ->
         "Invalid WORKFLOW.md config: #{inspect(other)}"
