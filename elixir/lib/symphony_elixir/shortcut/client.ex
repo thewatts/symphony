@@ -133,19 +133,69 @@ defmodule SymphonyElixir.Shortcut.Client do
     if is_nil(workflow_id_int) do
       {:error, {:invalid_shortcut_workflow_id, workflow_id}}
     else
-      do_search_stories(state_names, workflow_id_int, assignee_filter, nil, [])
+      with {:ok, state_id_map} <- fetch_workflow_state_map(workflow_id_int),
+           {:ok, state_ids} <- resolve_state_ids(state_names, state_id_map) do
+        do_search_stories(state_ids, workflow_id_int, assignee_filter, nil, [])
+      end
     end
   end
 
-  defp do_search_stories(state_names, workflow_id, assignee_filter, next_page_token, acc) do
+  # Fetches all workflow states and returns a downcased-name → id map.
+  defp fetch_workflow_state_map(workflow_id) do
+    with {:ok, headers} <- api_headers() do
+      case Req.get("#{@base_url}/workflows/#{workflow_id}",
+             headers: headers,
+             connect_options: [timeout: 30_000]
+           ) do
+        {:ok, %{status: 200, body: workflow}} ->
+          state_map =
+            workflow
+            |> Map.get("states", [])
+            |> Map.new(fn s -> {String.downcase(to_string(s["name"])), s["id"]} end)
+
+          {:ok, state_map}
+
+        {:ok, %{status: status}} ->
+          {:error, {:shortcut_api_status, status}}
+
+        {:error, reason} ->
+          {:error, {:shortcut_api_request, reason}}
+      end
+    end
+  end
+
+  # Resolves a list of state name strings to their integer IDs.
+  # Logs a warning for any name not found in the workflow.
+  defp resolve_state_ids(state_names, state_id_map) do
+    {ids, missing} =
+      Enum.reduce(state_names, {[], []}, fn name, {ids_acc, missing_acc} ->
+        key = String.downcase(String.trim(name))
+
+        case Map.get(state_id_map, key) do
+          nil -> {ids_acc, [name | missing_acc]}
+          id -> {[id | ids_acc], missing_acc}
+        end
+      end)
+
+    if missing != [] do
+      Logger.warning(
+        "Shortcut: state names not found in workflow: #{inspect(Enum.reverse(missing))}. " <>
+          "Available states: #{inspect(Map.keys(state_id_map))}"
+      )
+    end
+
+    {:ok, Enum.reverse(ids)}
+  end
+
+  defp do_search_stories(state_ids, workflow_id, assignee_filter, next_page_token, acc) do
     with {:ok, headers} <- api_headers() do
       body =
         %{
           "workflow_id" => workflow_id,
-          "workflow_state_types" => state_names_to_types(state_names),
+          "workflow_state_ids" => state_ids,
           "page_size" => @page_size
         }
-        |> maybe_put("next" , next_page_token)
+        |> maybe_put("next", next_page_token)
 
       case Req.post("#{@base_url}/stories/search",
              headers: headers,
@@ -154,12 +204,12 @@ defmodule SymphonyElixir.Shortcut.Client do
            ) do
         {:ok, %{status: 200, body: response}} ->
           stories = Map.get(response, "data", [])
-          issues = stories |> Enum.map(&normalize_story(&1, state_names, assignee_filter)) |> Enum.reject(&is_nil/1)
+          issues = stories |> Enum.map(&normalize_story(&1, assignee_filter)) |> Enum.reject(&is_nil/1)
           updated_acc = issues ++ acc
 
           case Map.get(response, "next") do
             token when is_binary(token) and token != "" ->
-              do_search_stories(state_names, workflow_id, assignee_filter, token, updated_acc)
+              do_search_stories(state_ids, workflow_id, assignee_filter, token, updated_acc)
 
             _ ->
               {:ok, Enum.reverse(updated_acc)}
@@ -196,7 +246,7 @@ defmodule SymphonyElixir.Shortcut.Client do
            connect_options: [timeout: 30_000]
          ) do
       {:ok, %{status: 200, body: stories}} when is_list(stories) ->
-        issues = stories |> Enum.map(&normalize_story(&1, nil, assignee_filter)) |> Enum.reject(&is_nil/1)
+        issues = stories |> Enum.map(&normalize_story(&1, assignee_filter)) |> Enum.reject(&is_nil/1)
         {:ok, issues}
 
       {:ok, %{status: status, body: body}} ->
@@ -210,33 +260,17 @@ defmodule SymphonyElixir.Shortcut.Client do
   end
 
   defp resolve_workflow_state_id(story_id, state_name, headers) do
-    # Fetch the story to find its current workflow, then find the target state
     case Req.get("#{@base_url}/stories/#{story_id}", headers: headers, connect_options: [timeout: 30_000]) do
       {:ok, %{status: 200, body: story}} ->
         workflow_id = story["workflow_id"]
 
-        case fetch_workflow_state(workflow_id, state_name, headers) do
-          {:ok, state_id} -> {:ok, state_id}
-          {:error, reason} -> {:error, reason}
-        end
+        with {:ok, state_map} <- fetch_workflow_state_map(workflow_id) do
+          key = String.downcase(String.trim(state_name))
 
-      {:ok, %{status: status}} ->
-        {:error, {:shortcut_api_status, status}}
-
-      {:error, reason} ->
-        {:error, {:shortcut_api_request, reason}}
-    end
-  end
-
-  defp fetch_workflow_state(workflow_id, state_name, headers) do
-    case Req.get("#{@base_url}/workflows/#{workflow_id}", headers: headers, connect_options: [timeout: 30_000]) do
-      {:ok, %{status: 200, body: workflow}} ->
-        states = Map.get(workflow, "states", [])
-        normalized_target = String.downcase(String.trim(state_name))
-
-        case Enum.find(states, fn s -> String.downcase(to_string(s["name"])) == normalized_target end) do
-          %{"id" => state_id} -> {:ok, state_id}
-          nil -> {:error, {:shortcut_state_not_found, state_name}}
+          case Map.get(state_map, key) do
+            nil -> {:error, {:shortcut_state_not_found, state_name}}
+            state_id -> {:ok, state_id}
+          end
         end
 
       {:ok, %{status: status}} ->
@@ -270,7 +304,7 @@ defmodule SymphonyElixir.Shortcut.Client do
     end
   end
 
-  defp normalize_story(story, _active_states, assignee_filter) when is_map(story) do
+  defp normalize_story(story, assignee_filter) when is_map(story) do
     assignee_ids =
       story
       |> Map.get("owner_ids", [])
@@ -296,7 +330,7 @@ defmodule SymphonyElixir.Shortcut.Client do
     }
   end
 
-  defp normalize_story(_story, _active_states, _assignee_filter), do: nil
+  defp normalize_story(_story, _assignee_filter), do: nil
 
   defp resolve_state_name(story) do
     # workflow_state may be embedded or just an ID — fall back to nil
@@ -328,14 +362,6 @@ defmodule SymphonyElixir.Shortcut.Client do
     |> Enum.map(fn blocker_id ->
       %{id: to_string(blocker_id), identifier: "sc-#{blocker_id}", state: nil}
     end)
-  end
-
-  defp state_names_to_types(state_names) when is_list(state_names) do
-    # Shortcut search accepts workflow_state_types: started, unstarted, done
-    # We pass the state names directly for name-based matching; the search
-    # endpoint also accepts `workflow_state_ids` but names are more portable.
-    # Return a deduplicated list of normalized names for the query.
-    Enum.uniq(state_names)
   end
 
   defp api_headers do
