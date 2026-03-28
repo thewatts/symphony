@@ -436,4 +436,22 @@ defmodule SymphonyElixir.Shortcut.Client do
   end
 
   defp inspect_body(body), do: inspect(body, limit: 20, printable_limit: @max_error_body_log_bytes)
+
+  # ---------------------------------------------------------------------------
+  # Test helpers (public for use in tests only)
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  @spec normalize_story_for_test(map(), term()) :: Issue.t() | nil
+  def normalize_story_for_test(story, assignee_filter), do: normalize_story(story, assignee_filter)
+
+  @doc false
+  @spec resolve_state_ids_for_test([String.t()], map()) :: {:ok, [integer()]}
+  def resolve_state_ids_for_test(state_names, state_map), do: resolve_state_ids(state_names, state_map)
+
+  @doc false
+  @spec build_state_map_for_test([map()]) :: map()
+  def build_state_map_for_test(states) do
+    Map.new(states, fn s -> {String.downcase(to_string(s["name"])), s["id"]} end)
+  end
 end
