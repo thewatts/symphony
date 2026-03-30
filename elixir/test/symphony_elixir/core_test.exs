@@ -1381,7 +1381,7 @@ defmodule SymphonyElixir.CoreTest do
       assert body["model"] == "claude-opus-4-6"
       assert is_list(body["tools"])
       tool_names = Enum.map(body["tools"], & &1["name"])
-      assert "shortcut_api" in tool_names
+      assert Enum.any?(tool_names, &(&1 in ["shortcut_api", "linear_graphql"]))
       assert is_list(body["messages"])
       assert List.first(body["messages"])["role"] == "user"
     after

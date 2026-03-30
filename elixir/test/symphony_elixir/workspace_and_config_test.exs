@@ -896,17 +896,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     previous_empty_secret_env = System.get_env(empty_secret_env)
     previous_missing_secret_env = System.get_env(missing_secret_env)
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    previous_shortcut_api_token = System.get_env("SHORTCUT_API_TOKEN")
 
     System.delete_env(missing_workspace_env)
     System.put_env(empty_secret_env, "")
     System.delete_env(missing_secret_env)
     System.put_env("LINEAR_API_KEY", "fallback-linear-token")
+    System.delete_env("SHORTCUT_API_TOKEN")
 
     on_exit(fn ->
       restore_env(missing_workspace_env, previous_missing_workspace_env)
       restore_env(empty_secret_env, previous_empty_secret_env)
       restore_env(missing_secret_env, previous_missing_secret_env)
       restore_env("LINEAR_API_KEY", previous_linear_api_key)
+      restore_env("SHORTCUT_API_TOKEN", previous_shortcut_api_token)
     end)
 
     assert {:ok, settings} =

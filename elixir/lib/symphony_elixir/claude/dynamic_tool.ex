@@ -1,9 +1,14 @@
 defmodule SymphonyElixir.Claude.DynamicTool do
   @moduledoc """
   Executes client-side tool calls requested by Claude during agentic turns.
+
+  Exposes either shortcut_api or linear_graphql depending on the configured
+  (or auto-detected) tracker kind.
   """
 
-  alias SymphonyElixir.Shortcut.Client
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.Client, as: LinearClient
+  alias SymphonyElixir.Shortcut.Client, as: ShortcutClient
 
   @shortcut_api_tool "shortcut_api"
   @shortcut_api_description """
@@ -33,11 +38,36 @@ defmodule SymphonyElixir.Claude.DynamicTool do
     }
   }
 
+  @linear_graphql_tool "linear_graphql"
+  @linear_graphql_description """
+  Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  """
+
+  @linear_graphql_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["query"],
+    "properties" => %{
+      "query" => %{
+        "type" => "string",
+        "description" => "GraphQL query or mutation document to execute against Linear."
+      },
+      "variables" => %{
+        "type" => "object",
+        "description" => "Optional GraphQL variables object.",
+        "additionalProperties" => true
+      }
+    }
+  }
+
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
       @shortcut_api_tool ->
         execute_shortcut_api(arguments, opts)
+
+      @linear_graphql_tool ->
+        execute_linear_graphql(arguments, opts)
 
       other ->
         failure_response(%{
@@ -51,17 +81,100 @@ defmodule SymphonyElixir.Claude.DynamicTool do
 
   @spec tool_specs() :: [map()]
   def tool_specs do
-    [
-      %{
-        "name" => @shortcut_api_tool,
-        "description" => @shortcut_api_description,
-        "input_schema" => @shortcut_api_input_schema
-      }
-    ]
+    case tracker_kind() do
+      "shortcut" ->
+        [%{"name" => @shortcut_api_tool, "description" => @shortcut_api_description, "input_schema" => @shortcut_api_input_schema}]
+
+      _ ->
+        [%{"name" => @linear_graphql_tool, "description" => @linear_graphql_description, "input_schema" => @linear_graphql_input_schema}]
+    end
+  end
+
+  defp tracker_kind do
+    case Config.effective_tracker_kind(Config.settings!()) do
+      {:ok, kind} -> kind
+      _ -> "linear"
+    end
+  end
+
+  defp execute_linear_graphql(arguments, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &LinearClient.graphql/3)
+
+    with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+         {:ok, response} <- linear_client.(query, variables, []) do
+      graphql_response(response)
+    else
+      {:error, reason} ->
+        failure_response(linear_tool_error_payload(reason))
+    end
+  end
+
+  defp normalize_linear_graphql_arguments(arguments) when is_binary(arguments) do
+    case String.trim(arguments) do
+      "" -> {:error, :missing_query}
+      query -> {:ok, query, %{}}
+    end
+  end
+
+  defp normalize_linear_graphql_arguments(arguments) when is_map(arguments) do
+    query = Map.get(arguments, "query") || Map.get(arguments, :query)
+    variables = Map.get(arguments, "variables") || Map.get(arguments, :variables) || %{}
+
+    cond do
+      not is_binary(query) or String.trim(query) == "" ->
+        {:error, :missing_query}
+
+      not is_map(variables) ->
+        {:error, :invalid_variables}
+
+      true ->
+        {:ok, String.trim(query), variables}
+    end
+  end
+
+  defp normalize_linear_graphql_arguments(_), do: {:error, :invalid_arguments}
+
+  defp graphql_response(response) do
+    success =
+      case response do
+        %{"errors" => errors} when is_list(errors) and errors != [] -> false
+        %{errors: errors} when is_list(errors) and errors != [] -> false
+        _ -> true
+      end
+
+    tool_result(success, encode_payload(response))
+  end
+
+  defp linear_tool_error_payload(:missing_query) do
+    %{"error" => %{"message" => "`linear_graphql` requires a non-empty `query` string."}}
+  end
+
+  defp linear_tool_error_payload(:invalid_arguments) do
+    %{"error" => %{"message" => "`linear_graphql` expects a query string or object with `query` and optional `variables`."}}
+  end
+
+  defp linear_tool_error_payload(:invalid_variables) do
+    %{"error" => %{"message" => "`linear_graphql.variables` must be a JSON object when provided."}}
+  end
+
+  defp linear_tool_error_payload(:missing_linear_api_token) do
+    %{"error" => %{"message" => "Symphony is missing Linear auth. Set `tracker.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."}}
+  end
+
+  defp linear_tool_error_payload({:linear_api_status, status}) do
+    %{"error" => %{"message" => "Linear GraphQL request failed with HTTP #{status}.", "status" => status}}
+  end
+
+  defp linear_tool_error_payload({:linear_api_request, reason}) do
+    %{"error" => %{"message" => "Linear GraphQL request failed.", "reason" => inspect(reason)}}
+  end
+
+  defp linear_tool_error_payload(reason) do
+    %{"error" => %{"message" => "Linear GraphQL tool execution failed.", "reason" => inspect(reason)}}
   end
 
   defp execute_shortcut_api(arguments, opts) do
-    shortcut_client = Keyword.get(opts, :shortcut_client, &Client.request/3)
+    shortcut_client = Keyword.get(opts, :shortcut_client, &ShortcutClient.request/3)
 
     with {:ok, method, path, body} <- normalize_shortcut_api_arguments(arguments),
          {:ok, response} <- shortcut_client.(method, path, body) do
@@ -164,6 +277,6 @@ defmodule SymphonyElixir.Claude.DynamicTool do
   end
 
   defp supported_tool_names do
-    Enum.map(tool_specs(), & &1["name"])
+    [@shortcut_api_tool, @linear_graphql_tool]
   end
 end

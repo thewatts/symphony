@@ -128,7 +128,7 @@ defmodule SymphonyElixir.AppServerTest do
     assert_receive {:request_body, body}
     assert body["model"] == "claude-opus-4-6"
     assert is_list(body["tools"])
-    assert Enum.any?(body["tools"], &(&1["name"] == "shortcut_api"))
+    assert Enum.any?(body["tools"], &(&1["name"] in ["shortcut_api", "linear_graphql"]))
     assert [%{"role" => "user", "content" => "Fix this bug"}] = body["messages"]
   end
 

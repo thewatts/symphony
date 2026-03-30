@@ -21,6 +21,8 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.AgentRunner,
           SymphonyElixir.CLI,
           SymphonyElixir.Claude.AppServer,
+          SymphonyElixir.Codex.AppServer,
+          SymphonyElixir.Codex.DynamicTool,
           SymphonyElixir.HttpServer,
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,

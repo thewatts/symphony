@@ -7,7 +7,9 @@ defmodule SymphonyElixir.Claude.DynamicToolTest do
   # tool_specs
   # ---------------------------------------------------------------------------
 
-  test "tool_specs advertises the shortcut_api input contract" do
+  test "tool_specs returns shortcut_api when tracker kind is shortcut" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "shortcut", tracker_project_slug: "123")
+
     assert [
              %{
                "name" => "shortcut_api",
@@ -31,6 +33,15 @@ defmodule SymphonyElixir.Claude.DynamicToolTest do
     assert "DELETE" in methods
   end
 
+  test "tool_specs returns linear_graphql when tracker kind is linear" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_api_token: "tok", tracker_project_slug: "proj")
+
+    assert [%{"name" => "linear_graphql", "description" => description, "input_schema" => %{"required" => ["query"]}}] =
+             DynamicTool.tool_specs()
+
+    assert description =~ "Linear"
+  end
+
   # ---------------------------------------------------------------------------
   # Unsupported tool
   # ---------------------------------------------------------------------------
@@ -41,7 +52,8 @@ defmodule SymphonyElixir.Claude.DynamicToolTest do
     assert result["success"] == false
     body = Jason.decode!(result["output"])
     assert body["error"]["message"] =~ "not_a_real_tool"
-    assert body["error"]["supportedTools"] == ["shortcut_api"]
+    assert "shortcut_api" in body["error"]["supportedTools"]
+    assert "linear_graphql" in body["error"]["supportedTools"]
   end
 
   # ---------------------------------------------------------------------------

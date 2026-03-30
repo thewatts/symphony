@@ -20,6 +20,12 @@ defmodule SymphonyElixir.Config do
   {% endif %}
   """
 
+  @type codex_runtime_settings :: %{
+          approval_policy: String.t() | map(),
+          thread_sandbox: String.t(),
+          turn_sandbox_policy: map()
+        }
+
   @type claude_runtime_settings :: %{
           api_key: String.t(),
           model: String.t(),
@@ -62,6 +68,33 @@ defmodule SymphonyElixir.Config do
   end
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
+
+  @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
+  def codex_turn_sandbox_policy(workspace \\ nil) do
+    case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
+      {:ok, policy} ->
+        policy
+
+      {:error, reason} ->
+        raise ArgumentError, message: "Invalid codex turn sandbox policy: #{inspect(reason)}"
+    end
+  end
+
+  @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
+          {:ok, codex_runtime_settings()} | {:error, term()}
+  def codex_runtime_settings(workspace \\ nil, opts \\ []) do
+    with {:ok, settings} <- settings() do
+      with {:ok, turn_sandbox_policy} <-
+             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+        {:ok,
+         %{
+           approval_policy: settings.codex.approval_policy,
+           thread_sandbox: settings.codex.thread_sandbox,
+           turn_sandbox_policy: turn_sandbox_policy
+         }}
+      end
+    end
+  end
 
   @spec workflow_prompt() :: String.t()
   def workflow_prompt do
@@ -111,31 +144,61 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  defp validate_semantics(settings) do
+  @spec effective_tracker_kind(Schema.t()) ::
+          {:ok, String.t()} | {:error, term()}
+  def effective_tracker_kind(settings) do
+    case settings.tracker.kind do
+      kind when kind in ["linear", "shortcut", "memory"] ->
+        {:ok, kind}
+
+      nil ->
+        detect_tracker_kind(settings)
+
+      other ->
+        {:error, {:unsupported_tracker_kind, other}}
+    end
+  end
+
+  defp detect_tracker_kind(_settings) do
+    shortcut_key = System.get_env("SHORTCUT_API_TOKEN")
+    linear_key = System.get_env("LINEAR_API_KEY")
+
     cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
+      is_binary(shortcut_key) and not is_binary(linear_key) ->
+        {:ok, "shortcut"}
 
-      settings.tracker.kind not in ["linear", "shortcut", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
+      is_binary(linear_key) and not is_binary(shortcut_key) ->
+        {:ok, "linear"}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      settings.tracker.kind == "shortcut" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_shortcut_api_token}
-
-      settings.tracker.kind == "shortcut" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_shortcut_workflow_id}
-
-      not is_binary(settings.claude.api_key) ->
-        {:error, :missing_anthropic_api_key}
+      is_binary(shortcut_key) and is_binary(linear_key) ->
+        {:error, :ambiguous_tracker_kind}
 
       true ->
-        :ok
+        {:error, :missing_tracker_kind}
+    end
+  end
+
+  defp validate_semantics(settings) do
+    with {:ok, kind} <- effective_tracker_kind(settings) do
+      cond do
+        kind == "linear" and not is_binary(settings.tracker.api_key) ->
+          {:error, :missing_linear_api_token}
+
+        kind == "linear" and not is_binary(settings.tracker.project_slug) ->
+          {:error, :missing_linear_project_slug}
+
+        kind == "shortcut" and not is_binary(settings.tracker.api_key) ->
+          {:error, :missing_shortcut_api_token}
+
+        kind == "shortcut" and not is_binary(settings.tracker.project_slug) ->
+          {:error, :missing_shortcut_workflow_id}
+
+        not is_binary(settings.claude.api_key) ->
+          {:error, :missing_anthropic_api_key}
+
+        true ->
+          :ok
+      end
     end
   end
 
@@ -161,6 +224,9 @@ defmodule SymphonyElixir.Config do
 
       :missing_shortcut_workflow_id ->
         "Missing Shortcut workflow ID. Set `tracker.project_slug` in `WORKFLOW.md`."
+
+      :ambiguous_tracker_kind ->
+        "Both SHORTCUT_API_TOKEN and LINEAR_API_KEY are set. Set `tracker.kind` in `WORKFLOW.md` to specify which to use."
 
       other ->
         "Invalid WORKFLOW.md config: #{inspect(other)}"
