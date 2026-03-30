@@ -27,7 +27,7 @@ defmodule SymphonyElixir.Shortcut.Client do
 
       true ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          fetch_stories_by_states(tracker.active_states, tracker.project_slug, assignee_filter)
+          fetch_stories_by_states(tracker.active_states, tracker.project_slug, assignee_filter, tracker.label)
         end
     end
   end
@@ -127,7 +127,7 @@ defmodule SymphonyElixir.Shortcut.Client do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp fetch_stories_by_states(state_names, workflow_id, assignee_filter) do
+  defp fetch_stories_by_states(state_names, workflow_id, assignee_filter, label \\ nil) do
     workflow_id_int = parse_int(workflow_id)
 
     if is_nil(workflow_id_int) do
@@ -135,7 +135,7 @@ defmodule SymphonyElixir.Shortcut.Client do
     else
       with {:ok, state_id_map} <- fetch_workflow_state_map(workflow_id_int),
            {:ok, state_ids} <- resolve_state_ids(state_names, state_id_map) do
-        do_search_stories(state_ids, workflow_id_int, assignee_filter, nil, [])
+        do_search_stories(state_ids, workflow_id_int, assignee_filter, label, nil, [])
       end
     end
   end
@@ -187,7 +187,7 @@ defmodule SymphonyElixir.Shortcut.Client do
     {:ok, Enum.reverse(ids)}
   end
 
-  defp do_search_stories(state_ids, workflow_id, assignee_filter, next_page_token, acc) do
+  defp do_search_stories(state_ids, workflow_id, assignee_filter, label, next_page_token, acc) do
     with {:ok, headers} <- api_headers() do
       body =
         %{
@@ -195,6 +195,7 @@ defmodule SymphonyElixir.Shortcut.Client do
           "workflow_state_ids" => state_ids,
           "page_size" => @page_size
         }
+        |> maybe_put("label_name", label)
         |> maybe_put("next", next_page_token)
 
       case Req.post("#{@base_url}/stories/search",
@@ -209,7 +210,7 @@ defmodule SymphonyElixir.Shortcut.Client do
 
           case Map.get(response, "next") do
             token when is_binary(token) and token != "" ->
-              do_search_stories(state_ids, workflow_id, assignee_filter, token, updated_acc)
+              do_search_stories(state_ids, workflow_id, assignee_filter, label, token, updated_acc)
 
             _ ->
               {:ok, Enum.reverse(updated_acc)}

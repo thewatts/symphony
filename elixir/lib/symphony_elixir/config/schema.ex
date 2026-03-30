@@ -50,6 +50,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:label, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -59,7 +60,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :label, :active_states, :terminal_states],
         empty_values: []
       )
     end
@@ -414,7 +415,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     claude = %{
       settings.claude
-      | api_key: resolve_secret_setting(settings.claude.api_key, System.get_env("ANTHROPIC_API_KEY"))
+      | api_key: resolve_secret_setting(settings.claude.api_key, System.get_env("SYMPHONY_ANTHROPIC_API_KEY") || System.get_env("ANTHROPIC_API_KEY"))
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex, claude: claude}

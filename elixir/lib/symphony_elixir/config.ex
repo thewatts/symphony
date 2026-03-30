@@ -217,7 +217,7 @@ defmodule SymphonyElixir.Config do
         "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"
 
       :missing_anthropic_api_key ->
-        "Missing Anthropic API key. Set `claude.api_key` in `WORKFLOW.md` or export `ANTHROPIC_API_KEY`."
+        "Missing Anthropic API key. Set `claude.api_key` in `WORKFLOW.md` or export `SYMPHONY_ANTHROPIC_API_KEY`."
 
       :missing_shortcut_api_token ->
         "Missing Shortcut API token. Set `tracker.api_key` in `WORKFLOW.md` or export `SHORTCUT_API_TOKEN`."

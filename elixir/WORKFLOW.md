@@ -2,15 +2,17 @@
 tracker:
   kind: shortcut
   api_key: $SHORTCUT_API_TOKEN
-  project_slug: "12345678"
+  project_slug: "500000005"
+  label: "ai-ready"
   active_states:
     - Ready for Development
     - In Development
     - Ready for Review
-    - In Review
   terminal_states:
-    - Completed
-    - Cancelled
+    - Complete
+    - Closed, Won't Fix
+    - Verified
+    - GA | Released
 polling:
   interval_ms: 5000
 workspace:
@@ -27,7 +29,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 claude:
-  api_key: $ANTHROPIC_API_KEY
+  api_key: $SYMPHONY_ANTHROPIC_API_KEY
   model: claude-opus-4-6
   max_tokens: 16384
 ---
