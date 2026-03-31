@@ -135,7 +135,17 @@ defmodule SymphonyElixir.Shortcut.Client do
     else
       with {:ok, state_id_map} <- fetch_workflow_state_map(workflow_id_int),
            {:ok, state_ids} <- resolve_state_ids(state_names, state_id_map) do
-        do_search_stories(state_ids, workflow_id_int, assignee_filter, label, nil, [])
+        # Build reverse map: id → name for state name lookup in normalize_story
+        state_id_to_name = Map.new(state_id_map, fn {name, id} -> {id, name} end)
+
+        state_ids
+        |> Enum.reduce_while({:ok, []}, fn state_id, {:ok, acc} ->
+          state_name = Map.get(state_id_to_name, state_id)
+          case do_search_stories(state_id, state_name, assignee_filter, label) do
+            {:ok, issues} -> {:cont, {:ok, acc ++ issues}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
       end
     end
   end
@@ -147,7 +157,7 @@ defmodule SymphonyElixir.Shortcut.Client do
              headers: headers,
              connect_options: [timeout: 30_000]
            ) do
-        {:ok, %{status: 200, body: workflow}} ->
+        {:ok, %{status: status, body: workflow}} when status in 200..299 ->
           state_map =
             workflow
             |> Map.get("states", [])
@@ -187,34 +197,20 @@ defmodule SymphonyElixir.Shortcut.Client do
     {:ok, Enum.reverse(ids)}
   end
 
-  defp do_search_stories(state_ids, workflow_id, assignee_filter, label, next_page_token, acc) do
+  defp do_search_stories(state_id, state_name, assignee_filter, label) do
     with {:ok, headers} <- api_headers() do
       body =
-        %{
-          "workflow_id" => workflow_id,
-          "workflow_state_ids" => state_ids,
-          "page_size" => @page_size
-        }
+        %{"workflow_state_id" => state_id}
         |> maybe_put("label_name", label)
-        |> maybe_put("next", next_page_token)
 
       case Req.post("#{@base_url}/stories/search",
              headers: headers,
              json: body,
              connect_options: [timeout: 30_000]
            ) do
-        {:ok, %{status: 200, body: response}} ->
-          stories = Map.get(response, "data", [])
-          issues = stories |> Enum.map(&normalize_story(&1, assignee_filter)) |> Enum.reject(&is_nil/1)
-          updated_acc = issues ++ acc
-
-          case Map.get(response, "next") do
-            token when is_binary(token) and token != "" ->
-              do_search_stories(state_ids, workflow_id, assignee_filter, label, token, updated_acc)
-
-            _ ->
-              {:ok, Enum.reverse(updated_acc)}
-          end
+        {:ok, %{status: status, body: stories}} when status in 200..299 and is_list(stories) ->
+          issues = stories |> Enum.map(&normalize_story(&1, state_name, assignee_filter)) |> Enum.reject(&is_nil/1)
+          {:ok, issues}
 
         {:ok, %{status: status, body: body}} ->
           Logger.error("Shortcut search failed status=#{status} body=#{inspect_body(body)}")
@@ -241,28 +237,64 @@ defmodule SymphonyElixir.Shortcut.Client do
   end
 
   defp fetch_stories_batch(ids, headers, assignee_filter) do
-    case Req.get("#{@base_url}/stories/bulk",
-           headers: headers,
-           params: [story_ids: Enum.join(ids, ",")],
-           connect_options: [timeout: 30_000]
-         ) do
-      {:ok, %{status: 200, body: stories}} when is_list(stories) ->
-        issues = stories |> Enum.map(&normalize_story(&1, assignee_filter)) |> Enum.reject(&is_nil/1)
-        {:ok, issues}
+    # Cache workflow state maps across batch to avoid repeated API calls
+    workflow_cache = %{}
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("Shortcut bulk fetch failed status=#{status} body=#{inspect_body(body)}")
-        {:error, {:shortcut_api_status, status}}
+    ids
+    |> Enum.reduce_while({:ok, [], workflow_cache}, fn id, {:ok, acc, cache} ->
+      case Req.get("#{@base_url}/stories/#{id}", headers: headers, connect_options: [timeout: 30_000]) do
+        {:ok, %{status: status, body: story}} when status in 200..299 ->
+          {state_name, updated_cache} = resolve_state_name_from_cache(story, cache)
+          issue = normalize_story(story, state_name, assignee_filter)
+          {:cont, {:ok, if(issue, do: acc ++ [issue], else: acc), updated_cache}}
 
-      {:error, reason} ->
-        Logger.error("Shortcut bulk fetch request failed: #{inspect(reason)}")
-        {:error, {:shortcut_api_request, reason}}
+        {:ok, %{status: 404}} ->
+          {:cont, {:ok, acc, cache}}
+
+        {:ok, %{status: status, body: body}} ->
+          Logger.error("Shortcut story fetch failed status=#{status} body=#{inspect_body(body)}")
+          {:halt, {:error, {:shortcut_api_status, status}}}
+
+        {:error, reason} ->
+          Logger.error("Shortcut story fetch request failed: #{inspect(reason)}")
+          {:halt, {:error, {:shortcut_api_request, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, issues, _cache} -> {:ok, issues}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Resolves state name for a story using a cached workflow state map.
+  # Returns {state_name_or_nil, updated_cache}.
+  defp resolve_state_name_from_cache(story, cache) do
+    workflow_id = story["workflow_id"]
+    state_id = story["workflow_state_id"]
+
+    if is_nil(workflow_id) or is_nil(state_id) do
+      {nil, cache}
+    else
+      case Map.get(cache, workflow_id) do
+        nil ->
+          case fetch_workflow_state_map(workflow_id) do
+            {:ok, state_map} ->
+              id_to_name = Map.new(state_map, fn {name, id} -> {id, name} end)
+              {Map.get(id_to_name, state_id), Map.put(cache, workflow_id, id_to_name)}
+
+            {:error, _} ->
+              {nil, cache}
+          end
+
+        id_to_name ->
+          {Map.get(id_to_name, state_id), cache}
+      end
     end
   end
 
   defp resolve_workflow_state_id(story_id, state_name, headers) do
     case Req.get("#{@base_url}/stories/#{story_id}", headers: headers, connect_options: [timeout: 30_000]) do
-      {:ok, %{status: 200, body: story}} ->
+      {:ok, %{status: status, body: story}} when status in 200..299 ->
         workflow_id = story["workflow_id"]
 
         with {:ok, state_map} <- fetch_workflow_state_map(workflow_id) do
@@ -293,7 +325,7 @@ defmodule SymphonyElixir.Shortcut.Client do
   defp resolve_self_assignee_filter do
     with {:ok, headers} <- api_headers() do
       case Req.get("#{@base_url}/member", headers: headers, connect_options: [timeout: 30_000]) do
-        {:ok, %{status: 200, body: %{"id" => member_id}}} ->
+        {:ok, %{status: status, body: %{"id" => member_id}}} when status in 200..299 ->
           {:ok, %{match_values: MapSet.new([to_string(member_id)])}}
 
         {:ok, _} ->
@@ -305,7 +337,7 @@ defmodule SymphonyElixir.Shortcut.Client do
     end
   end
 
-  defp normalize_story(story, assignee_filter) when is_map(story) do
+  defp normalize_story(story, state_name_override \\ nil, assignee_filter) when is_map(story) do
     assignee_ids =
       story
       |> Map.get("owner_ids", [])
@@ -319,7 +351,7 @@ defmodule SymphonyElixir.Shortcut.Client do
       title: story["name"],
       description: story["description"],
       priority: parse_priority(story["priority"]),
-      state: get_in(story, ["workflow_state", "name"]) || resolve_state_name(story),
+      state: get_in(story, ["workflow_state", "name"]) || resolve_state_name(story) || state_name_override,
       branch_name: Map.get(story, "branch_ids", []) |> List.first() |> then(&if(&1, do: "sc-#{story["id"]}", else: nil)),
       url: story["app_url"],
       assignee_id: primary_assignee_id,
@@ -331,7 +363,7 @@ defmodule SymphonyElixir.Shortcut.Client do
     }
   end
 
-  defp normalize_story(_story, _assignee_filter), do: nil
+  defp normalize_story(_story, _state_name_override, _assignee_filter), do: nil
 
   defp resolve_state_name(story) do
     # workflow_state may be embedded or just an ID — fall back to nil
@@ -444,7 +476,7 @@ defmodule SymphonyElixir.Shortcut.Client do
 
   @doc false
   @spec normalize_story_for_test(map(), term()) :: Issue.t() | nil
-  def normalize_story_for_test(story, assignee_filter), do: normalize_story(story, assignee_filter)
+  def normalize_story_for_test(story, assignee_filter), do: normalize_story(story, nil, assignee_filter)
 
   @doc false
   @spec resolve_state_ids_for_test([String.t()], map()) :: {:ok, [integer()]}

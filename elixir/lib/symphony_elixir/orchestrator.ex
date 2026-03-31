@@ -224,9 +224,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
+    validate_result = Config.validate!()
+    Logger.info("maybe_dispatch validate=#{inspect(validate_result)}")
+
+    fetch_result = if validate_result == :ok, do: Tracker.fetch_candidate_issues(), else: {:skip, :validation_failed}
+    Logger.info("maybe_dispatch fetch=#{inspect(fetch_result)}")
+
+    with :ok <- validate_result,
+         {:ok, issues} <- fetch_result,
          true <- available_slots(state) > 0 do
+      Logger.info("maybe_dispatch dispatching issues=#{length(issues)}")
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -239,7 +246,22 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
+        state
 
+      {:error, :missing_anthropic_api_key} ->
+        Logger.error("Anthropic API key missing. Set claude.api_key in WORKFLOW.md or export SYMPHONY_ANTHROPIC_API_KEY.")
+        state
+
+      {:error, :missing_shortcut_api_token} ->
+        Logger.error("Shortcut API token missing. Set tracker.api_key in WORKFLOW.md or export SHORTCUT_API_TOKEN.")
+        state
+
+      {:error, :missing_shortcut_workflow_id} ->
+        Logger.error("Shortcut workflow ID missing. Set tracker.project_slug in WORKFLOW.md.")
+        state
+
+      {:error, :ambiguous_tracker_kind} ->
+        Logger.error("Both SHORTCUT_API_TOKEN and LINEAR_API_KEY are set. Set tracker.kind explicitly in WORKFLOW.md.")
         state
 
       {:error, {:unsupported_tracker_kind, kind}} ->

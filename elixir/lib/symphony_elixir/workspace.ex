@@ -296,9 +296,16 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
+    hook_env = [
+      {"SYMPHONY_WORKSPACE_PATH", workspace},
+      {"SYMPHONY_STORY_ID", to_string(issue_context.issue_id || "")},
+      {"SYMPHONY_ISSUE_IDENTIFIER", to_string(issue_context.issue_identifier || "")},
+      {"SYMPHONY_BRANCH_NAME", to_string(issue_context.branch_name || issue_context.issue_identifier || "")}
+    ]
+
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true, env: hook_env)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -456,10 +463,11 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      branch_name: Map.get(issue, :branch_name)
     }
   end
 

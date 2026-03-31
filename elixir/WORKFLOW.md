@@ -16,15 +16,12 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
-  root: ~/code/symphony-workspaces
+  root: ~/code/portal
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
-    if command -v mise >/dev/null 2>&1; then
-      cd elixir && mise trust && mise exec -- mix deps.get
-    fi
+    ~/bin/symphony_portal
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    cd ~/code/portal/portal && git worktree remove "$SYMPHONY_WORKSPACE_PATH" --force
 agent:
   max_concurrent_agents: 10
   max_turns: 20
