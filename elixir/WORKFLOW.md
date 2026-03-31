@@ -28,7 +28,6 @@ agent:
 claude:
   api_key: $SYMPHONY_ANTHROPIC_API_KEY
   model: claude-opus-4-6
-  max_tokens: 16384
 ---
 
 You are working on issue `{{ issue.identifier }}`

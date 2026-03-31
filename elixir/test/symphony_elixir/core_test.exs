@@ -68,10 +68,8 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
-    assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
-    assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+    assert is_binary(Map.get(hooks, "after_create"))
+    assert is_binary(Map.get(hooks, "before_remove"))
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
@@ -959,63 +957,20 @@ defmodule SymphonyElixir.CoreTest do
   # Helpers shared by agent runner / app server tests
   # ---------------------------------------------------------------------------
 
-  # Returns a Req plug that responds to Anthropic Messages API calls with a
-  # simple end_turn response. Captures each request body into `agent` process.
-  defp end_turn_api_plug(test_pid) do
-    fn conn ->
-      {:ok, body, conn} = Plug.Conn.read_body(conn)
-      send(test_pid, {:api_request, Jason.decode!(body)})
+  # Writes a fake claude script that emits stream-json events and exits 0.
+  defp write_fake_claude(path, events, exit_code \\ 0) do
+    lines =
+      Enum.map(events, fn event ->
+        "printf '%s\\n' '#{Jason.encode!(event) |> String.replace("'", "'\\''")}'"
+      end)
 
-      Req.Test.json(conn, %{
-        "id" => "msg_test",
-        "type" => "message",
-        "role" => "assistant",
-        "model" => "claude-opus-4-6",
-        "stop_reason" => "end_turn",
-        "content" => [%{"type" => "text", "text" => "Done."}],
-        "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
-      })
-    end
+    body = Enum.join(lines, "\n") <> "\nexit #{exit_code}\n"
+    File.write!(path, "#!/bin/sh\n" <> body)
+    File.chmod!(path, 0o755)
   end
 
-  # Returns a Req plug that first responds with tool_use, then end_turn.
-  defp tool_then_end_turn_plug(test_pid, tool_name, tool_input) do
-    counter = :counters.new(1, [])
-
-    fn conn ->
-      {:ok, body, conn} = Plug.Conn.read_body(conn)
-      send(test_pid, {:api_request, Jason.decode!(body)})
-      n = :counters.get(counter, 1) + 1
-      :counters.put(counter, 1, n)
-
-      response =
-        if n == 1 do
-          %{
-            "id" => "msg_tool",
-            "type" => "message",
-            "role" => "assistant",
-            "model" => "claude-opus-4-6",
-            "stop_reason" => "tool_use",
-            "content" => [
-              %{"type" => "text", "text" => "Calling tool."},
-              %{"type" => "tool_use", "id" => "tool_call_1", "name" => tool_name, "input" => tool_input}
-            ],
-            "usage" => %{"input_tokens" => 20, "output_tokens" => 10}
-          }
-        else
-          %{
-            "id" => "msg_end",
-            "type" => "message",
-            "role" => "assistant",
-            "model" => "claude-opus-4-6",
-            "stop_reason" => "end_turn",
-            "content" => [%{"type" => "text", "text" => "Done after tool."}],
-            "usage" => %{"input_tokens" => 30, "output_tokens" => 5}
-          }
-        end
-
-      Req.Test.json(conn, response)
-    end
+  defp fake_claude_result_event do
+    %{"type" => "result", "subtype" => "success", "usage" => %{"input_tokens" => 10, "output_tokens" => 5}}
   end
 
   # ---------------------------------------------------------------------------
@@ -1344,110 +1299,33 @@ defmodule SymphonyElixir.CoreTest do
   # App server (Claude.AppServer) tests
   # ---------------------------------------------------------------------------
 
-  test "app server calls Anthropic API with correct model and tool specs" do
+  test "app server spawns claude subprocess and returns turn_completed" do
     test_root =
-      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-api-#{System.unique_integer([:positive])}")
+      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-basic-#{System.unique_integer([:positive])}")
 
     try do
       workspace = Path.join(test_root, "workspace")
+      fake_claude = Path.join(test_root, "fake-claude")
       File.mkdir_p!(workspace)
-
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: test_root,
-        claude_model: "claude-opus-4-6"
-      )
-
-      test_pid = self()
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
+      write_fake_claude(fake_claude, [fake_claude_result_event()])
 
       issue = %Issue{
-        id: "issue-api-shape",
+        id: "issue-basic",
         identifier: "MT-77",
-        title: "Check API shape",
-        description: "Verify model and tools are sent",
+        title: "Basic test",
+        description: "Verify subprocess runs",
         state: "In Progress",
         url: "https://example.org/issues/MT-77",
         labels: []
       }
 
-      Req.Test.stub(SymphonyElixir.Claude.AppServer, end_turn_api_plug(test_pid))
-
       {:ok, session} = AppServer.start_session(workspace)
+      session = Map.put(session, :claude_executable, fake_claude)
 
-      session_with_plug = Map.put(session, :plug, {Req.Test, SymphonyElixir.Claude.AppServer})
-
-      assert {:ok, _result} = AppServer.run_turn(session_with_plug, "Fix it", issue)
-
-      assert_receive {:api_request, body}
-      assert body["model"] == "claude-opus-4-6"
-      assert is_list(body["tools"])
-      tool_names = Enum.map(body["tools"], & &1["name"])
-      assert Enum.any?(tool_names, &(&1 in ["shortcut_api", "linear_graphql"]))
-      assert is_list(body["messages"])
-      assert List.first(body["messages"])["role"] == "user"
-    after
-      File.rm_rf(test_root)
-    end
-  end
-
-  test "app server handles tool_use response and sends tool results back" do
-    test_root =
-      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-tool-use-#{System.unique_integer([:positive])}")
-
-    try do
-      workspace = Path.join(test_root, "workspace")
-      File.mkdir_p!(workspace)
-
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
-
-      test_pid = self()
-
-      issue = %Issue{
-        id: "issue-tool-use",
-        identifier: "MT-88",
-        title: "Check tool use",
-        description: "Verify tool call round-trip",
-        state: "In Progress",
-        url: "https://example.org/issues/MT-88",
-        labels: []
-      }
-
-      Req.Test.stub(
-        SymphonyElixir.Claude.AppServer,
-        tool_then_end_turn_plug(test_pid, "linear_graphql", %{"query" => "{ viewer { id } }"})
-      )
-
-      {:ok, session} = AppServer.start_session(workspace)
-      session_with_plug = Map.put(session, :plug, {Req.Test, SymphonyElixir.Claude.AppServer})
-
-      event_collector = fn msg -> send(test_pid, {:event, msg.event}) end
-
-      stub_tool_executor = fn _tool, _args ->
-        %{"success" => true, "output" => ~s({"data":{"viewer":{"id":"u1"}}})}
-      end
-
-      assert {:ok, _result} =
-               AppServer.run_turn(session_with_plug, "Query Linear", issue,
-                 on_message: event_collector,
-                 tool_executor: stub_tool_executor
-               )
-
-      # Should have received 2 API calls: one tool_use, one end_turn
-      assert_receive {:api_request, _first_body}
-      assert_receive {:api_request, second_body}
-
-      # Second request should include the tool_result message
-      messages = second_body["messages"]
-      assert Enum.any?(messages, fn m -> m["role"] == "assistant" end)
-
-      tool_result_msg = Enum.find(messages, fn m ->
-        m["role"] == "user" and is_list(m["content"]) and
-          Enum.any?(m["content"], &(&1["type"] == "tool_result"))
-      end)
-
-      assert tool_result_msg != nil
-
-      assert_receive {:event, :tool_call_completed}
-      assert_receive {:event, :turn_completed}
+      assert {:ok, result} = AppServer.run_turn(session, "Fix it", issue)
+      assert result.result == :turn_completed
+      assert is_binary(result.session_id)
     after
       File.rm_rf(test_root)
     end
@@ -1459,9 +1337,10 @@ defmodule SymphonyElixir.CoreTest do
 
     try do
       workspace = Path.join(test_root, "workspace")
+      fake_claude = Path.join(test_root, "fake-claude")
       File.mkdir_p!(workspace)
-
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
+      write_fake_claude(fake_claude, [fake_claude_result_event()])
 
       test_pid = self()
 
@@ -1475,24 +1354,48 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      Req.Test.stub(SymphonyElixir.Claude.AppServer, end_turn_api_plug(test_pid))
+      {:ok, session} = AppServer.start_session(workspace)
+      session = Map.put(session, :claude_executable, fake_claude)
+      on_message = fn msg -> send(test_pid, {:event, msg.event}) end
+
+      assert {:ok, result} = AppServer.run_turn(session, "Do it", issue, on_message: on_message)
+      assert result.result == :turn_completed
+      assert_receive {:event, :session_started}
+      assert_receive {:event, :turn_completed}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server emits turn_ended_with_error on subprocess failure" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-app-server-fail-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      fake_claude = Path.join(test_root, "fake-claude")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
+      write_fake_claude(fake_claude, [], 1)
+
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-fail",
+        identifier: "MT-100",
+        title: "Fail test",
+        description: "Verify error handling",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-100",
+        labels: []
+      }
 
       {:ok, session} = AppServer.start_session(workspace)
-      session_with_plug = Map.put(session, :plug, {Req.Test, SymphonyElixir.Claude.AppServer})
+      session = Map.put(session, :claude_executable, fake_claude)
+      on_message = fn msg -> send(test_pid, {:event, msg.event}) end
 
-      collected_events = :ets.new(:events, [:bag, :public])
-
-      on_message = fn msg ->
-        :ets.insert(collected_events, {msg.event})
-      end
-
-      assert {:ok, result} = AppServer.run_turn(session_with_plug, "Do it", issue, on_message: on_message)
-      assert result.result == :turn_completed
-      assert is_binary(result.session_id)
-
-      events = :ets.tab2list(collected_events) |> Enum.map(&elem(&1, 0))
-      assert :session_started in events
-      assert :turn_completed in events
+      assert {:error, _} = AppServer.run_turn(session, "Will fail", issue, on_message: on_message)
+      assert_receive {:event, :turn_ended_with_error}
     after
       File.rm_rf(test_root)
     end

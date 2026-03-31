@@ -300,7 +300,7 @@ defmodule SymphonyElixir.Workspace do
       {"SYMPHONY_WORKSPACE_PATH", workspace},
       {"SYMPHONY_STORY_ID", to_string(issue_context.issue_id || "")},
       {"SYMPHONY_ISSUE_IDENTIFIER", to_string(issue_context.issue_identifier || "")},
-      {"SYMPHONY_BRANCH_NAME", to_string(issue_context.branch_name || issue_context.issue_identifier || "")}
+      {"SYMPHONY_BRANCH_NAME", to_string(Map.get(issue_context, :branch_name) || issue_context.issue_identifier || "")}
     ]
 
     task =
@@ -474,14 +474,16 @@ defmodule SymphonyElixir.Workspace do
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      branch_name: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      branch_name: nil
     }
   end
 
